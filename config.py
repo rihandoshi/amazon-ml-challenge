@@ -1,5 +1,47 @@
 """Shared config / constants for the entity resolution pipeline."""
 
+# ---------------------------------------------------------------------------
+# Experiment / ablation flags — flip these to compare runs
+# ---------------------------------------------------------------------------
+USE_TOKEN_BLOCKING = True
+USE_ANN = True                    # requires --use-embeddings CLI flag too
+USE_SEPARATE_NAME_ANN = False     # ANN on name-only text (experimental)
+USE_ADDRESS_ANN = False           # ANN on address-only text (experimental)
+USE_CHAR_NGRAM_FEATURES = True    # char 3/4-gram cosine sim features
+USE_ASYMMETRIC_E5_PREFIXES = True # "query:" for S1, "passage:" for S2/S3
+
+# ---------------------------------------------------------------------------
+# Token-blocking safety limits — prevent many-to-many memory explosion
+# ---------------------------------------------------------------------------
+# Skip any (country, token) block whose estimated pair count
+# (s1_count × other_count) exceeds this.  Sensible range: 500–10_000.
+MAX_TOKEN_BLOCK_PAIRS = 5_000
+
+# Also skip any individual token that appears in > this many records on
+# either side.  Acts as a backstop independent of the cross-product check.
+MAX_TOKEN_FREQ = 2_000
+
+# ---------------------------------------------------------------------------
+# Candidate ranking / capping
+# ---------------------------------------------------------------------------
+# After blocking, keep the top-K candidates per S1 entity from each source.
+# Lexical candidates (token/zip/city blocking) are ranked by name quick_score.
+# ANN candidates are ranked by their ANN cosine similarity.
+# The two pools are unioned, so an S1 entity can have up to LEX+ANN candidates.
+CANDIDATE_CAP_LEXICAL = 40        # top-K from lexical/token blocking
+CANDIDATE_CAP_ANN = 20            # top-K from ANN (guaranteed slots)
+
+# ---------------------------------------------------------------------------
+# ANN retrieval
+# ---------------------------------------------------------------------------
+ANN_TOP_K = 10                    # neighbours to retrieve per query
+
+# ---------------------------------------------------------------------------
+# Negative sampling
+# ---------------------------------------------------------------------------
+MAX_NEGATIVES_PER_ENTITY = 20     # hard negatives from blocking candidates
+
+# ---------------------------------------------------------------------------
 # Legal-suffix / common-word normalization for business names.
 # Longer keys first is NOT required here because we match whole tokens after splitting.
 NAME_TOKEN_MAP = {

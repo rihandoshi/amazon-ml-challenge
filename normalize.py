@@ -15,6 +15,11 @@ _MULTISPACE_RE = re.compile(r"\s+")
 _DIGIT_RE = re.compile(r"\d+")
 _ZIP5_RE = re.compile(r"\b(\d{5})(-\d{4})?\b")
 _PIN6_RE = re.compile(r"\b(\d{6})\b")
+# French postal codes are also 5 digits; generic 5-digit pattern for non-US countries
+_GENERIC_POSTAL_RE = re.compile(r"\b(\d{5})\b")
+
+# Pattern for house/building numbers at the start of an address
+_HOUSE_NO_RE = re.compile(r"^\s*(\d+[a-z]?(?:[\s/-]\d+)?)\b", re.IGNORECASE)
 
 # Minimal Devanagari -> Latin phonetic transliteration table.
 # This is a *rule-based character map*, not a lookup service — same category as
@@ -85,6 +90,10 @@ def normalize_name(raw_name: str) -> dict:
 
 
 def _extract_state(text: str, country: str):
+    """Extract state from address text.
+
+    Language-agnostic: for unknown countries, returns None gracefully.
+    """
     if country == "US":
         for full, abbr in US_STATES.items():
             if re.search(rf"\b{re.escape(full)}\b", text):
@@ -94,11 +103,125 @@ def _extract_state(text: str, country: str):
                 return abbr
         return None
     if country == "India":
-        for st in INDIAN_STATES:
+        # Try longer state names first (e.g. "madhya pradesh" before "pradesh")
+        for st in sorted(INDIAN_STATES, key=len, reverse=True):
             if re.search(rf"\b{re.escape(st)}\b", text):
                 return st
         return None
+    # For unknown countries, don't attempt state extraction
     return None
+
+
+def _is_likely_city_segment(seg: str, state: str, country: str) -> bool:
+    """Determine if a comma-separated segment is likely a city name
+    rather than a street address, zip code, or state.
+
+    Heuristics:
+    - Not a pure number / zip / pin code
+    - Not the state itself
+    - Not dominated by house-number-like patterns (e.g. "19 1/2 STARDUST TRAIL")
+    - Primarily alphabetic (cities are word-like, not number-heavy)
+    """
+    seg_cleaned = _clean_basic(seg)
+    if not seg_cleaned:
+        return False
+
+    # Skip if it matches the state
+    if state and state.lower() in seg_cleaned:
+        return False
+
+    # Skip pure zip/pin codes
+    if _ZIP5_RE.fullmatch(seg.strip()) or _PIN6_RE.fullmatch(seg.strip()):
+        return False
+
+    # Skip if it starts with a number (likely a street address)
+    if re.match(r"^\d", seg_cleaned):
+        return False
+
+    # Skip if the segment is very long and has many digits (likely a full address)
+    digit_count = sum(1 for c in seg_cleaned if c.isdigit())
+    alpha_count = sum(1 for c in seg_cleaned if c.isalpha())
+    if alpha_count == 0:
+        return False
+
+    # A city segment should be primarily alphabetic
+    # Allow some digits (e.g. in compound names) but not mostly digits
+    if digit_count > alpha_count:
+        return False
+
+    return True
+
+
+def _extract_city_improved(raw_addr: str, state: str, zip_code: str, country: str) -> str:
+    """Improved city extraction from comma-separated address.
+
+    Handles problematic formats like:
+        "GREENSBORO, NC, 19 1/2 STARDUST TRAIL" → "greensboro"
+        "1795 Westchester Drive, High Point, NC" → "high point"
+        "G-3/571, GULMOHAR COLONY, BHOPAL, Madhya Pradesh" → "bhopal"
+
+    Strategy:
+    1. Split on commas
+    2. For each segment, check if it looks like a city (alphabetic, not state/zip,
+       not a street address)
+    3. Among city candidates, prefer:
+       - The segment right before the state (if state is present)
+       - Otherwise the *first* city-like segment that isn't the first segment
+         (first segment is usually a street address)
+       - Fallback: the first non-address segment
+    """
+    segments = [s.strip() for s in re.split(r",", raw_addr) if s.strip()]
+    if not segments:
+        return None
+
+    # Find all city-candidate segments with their positions
+    city_candidates = []
+    state_position = -1
+    for idx, seg in enumerate(segments):
+        seg_l = seg.lower().strip()
+        # Track state position
+        if state:
+            if state.lower() in seg_l:
+                state_position = idx
+                continue
+
+        if _is_likely_city_segment(seg, state, country):
+            city_candidates.append((idx, _clean_basic(seg)))
+
+    if not city_candidates:
+        return None
+
+    # Strategy 1: city just before the state position
+    if state_position > 0:
+        for idx, city in city_candidates:
+            if idx == state_position - 1:
+                return city
+
+    # Strategy 2: if state is at position 1 (e.g. "GREENSBORO, NC, ..."),
+    # the segment at position 0 is the city
+    if state_position == 1 and city_candidates:
+        # Check if the first segment is actually a city (not a street)
+        if city_candidates[0][0] == 0:
+            return city_candidates[0][1]
+
+    # Strategy 3: for Indian addresses, city is typically the segment
+    # just before the state (already covered) or the last city-like segment
+    # before the state
+    if state_position >= 0:
+        before_state = [(i, c) for i, c in city_candidates if i < state_position]
+        if before_state:
+            return before_state[-1][1]
+
+    # Strategy 4: for addresses without a recognized state,
+    # prefer later city-like segments (last non-address segment tends to be city)
+    if len(city_candidates) > 1:
+        # Skip the first segment (usually street address), take the last candidate
+        non_first = [(i, c) for i, c in city_candidates if i > 0]
+        if non_first:
+            return non_first[-1][1]
+
+    # Fallback: first candidate
+    return city_candidates[0][1]
 
 
 def normalize_address(raw_addr: str, country: str) -> dict:
@@ -114,35 +237,31 @@ def normalize_address(raw_addr: str, country: str) -> dict:
     mapped = [ADDRESS_TOKEN_MAP.get(t, t) for t in tokens]
     norm_addr = " ".join(mapped)
 
+    # --- ZIP/PIN extraction ---
     zip_code = None
-    m = _ZIP5_RE.search(raw_addr) if country == "US" else None
-    if m:
-        zip_code = m.group(1)
-    m6 = _PIN6_RE.search(raw_addr) if country == "India" else None
-    if m6:
-        zip_code = m6.group(1)
+    if country == "US":
+        m = _ZIP5_RE.search(raw_addr)
+        if m:
+            zip_code = m.group(1)
+    elif country == "India":
+        m6 = _PIN6_RE.search(raw_addr)
+        if m6:
+            zip_code = m6.group(1)
+    else:
+        # Generic postal code extraction for unknown countries (e.g. France: 5-digit)
+        m = _GENERIC_POSTAL_RE.search(raw_addr)
+        if m:
+            zip_code = m.group(1)
 
+    # --- State extraction ---
     state = _extract_state(norm_addr, country)
 
-    # crude city guess: comma-separated segment right before the state/zip,
-    # falling back to the second-to-last comma segment.
-    segments = [s.strip() for s in re.split(r",", raw_addr) if s.strip()]
-    city = None
-    if segments:
-        for seg in reversed(segments):
-            seg_l = seg.lower()
-            if state and state.lower() in seg_l:
-                continue
-            if _ZIP5_RE.fullmatch(seg.strip()) or _PIN6_RE.fullmatch(seg.strip()):
-                continue
-            city = _clean_basic(seg)
-            if city:
-                break
+    # --- City extraction (improved) ---
+    city = _extract_city_improved(raw_addr, state, zip_code, country)
 
+    # --- House number extraction ---
     house_no = None
-    m = _DIGIT_RE.search(mapped[0]) if mapped else None
-    # first standalone leading number in the address, common for street numbers
-    lead = re.match(r"^\s*(\d+[a-z]?)", cleaned)
+    lead = _HOUSE_NO_RE.match(cleaned)
     if lead:
         house_no = lead.group(1)
 

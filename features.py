@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz, distance
 
+from config import USE_CHAR_NGRAM_FEATURES
+
 
 FEATURE_COLUMNS = [
     "name_jaro_winkler", "name_levenshtein_ratio", "name_token_sort_ratio",
@@ -18,11 +20,62 @@ FEATURE_COLUMNS = [
     "city_exact_match", "city_fuzzy_score", "state_exact_match",
     "zip_exact_match", "zip_present_both", "house_no_exact_match",
     "country_match",
+    # Char n-gram cosine similarity features (added when USE_CHAR_NGRAM_FEATURES=True)
+    "name_char_3gram_cosine", "name_char_4gram_cosine",
+    "addr_char_3gram_cosine",
 ]
 
 
 def _safe(s):
     return s if isinstance(s, str) else ""
+
+
+def _char_ngrams(text: str, n: int) -> dict:
+    """Extract character n-grams from text and return as a frequency dict.
+
+    Efficient implementation that avoids building large TF-IDF matrices:
+    computes n-grams only for the specific pair being compared.
+    """
+    if not text or len(text) < n:
+        return {}
+    grams = {}
+    for i in range(len(text) - n + 1):
+        gram = text[i:i + n]
+        grams[gram] = grams.get(gram, 0) + 1
+    return grams
+
+
+def _ngram_cosine_sim(text_a: str, text_b: str, n: int) -> float:
+    """Cosine similarity between char n-gram frequency vectors of two strings.
+
+    Efficient pairwise computation: no TF-IDF matrix needed, just counts
+    for the two strings being compared.
+
+    Captures: typos, punctuation diffs, spacing, abbreviations,
+    transliteration differences, small spelling variations.
+    """
+    if not text_a or not text_b:
+        return 0.0
+
+    grams_a = _char_ngrams(text_a, n)
+    grams_b = _char_ngrams(text_b, n)
+
+    if not grams_a or not grams_b:
+        return 0.0
+
+    # Compute cosine similarity using only shared keys (sparse dot product)
+    common_keys = set(grams_a.keys()) & set(grams_b.keys())
+    if not common_keys:
+        return 0.0
+
+    dot = sum(grams_a[k] * grams_b[k] for k in common_keys)
+    norm_a = sum(v * v for v in grams_a.values()) ** 0.5
+    norm_b = sum(v * v for v in grams_b.values()) ** 0.5
+
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+
+    return dot / (norm_a * norm_b)
 
 
 def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.DataFrame) -> pd.DataFrame:
@@ -57,6 +110,11 @@ def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.D
     addr_partial = np.empty(n); common_frac = np.empty(n); first_tok = np.empty(n)
     city_fuzzy = np.empty(n)
 
+    # Char n-gram arrays (always allocated; filled with 0 if disabled)
+    name_3gram = np.zeros(n)
+    name_4gram = np.zeros(n)
+    addr_3gram = np.zeros(n)
+
     left = left.tolist(); right = right.tolist()
     left_addr = left_addr.tolist(); right_addr = right_addr.tolist()
     left_tokens = left_tokens.tolist(); right_tokens = right_tokens.tolist()
@@ -87,6 +145,12 @@ def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.D
         lc, rc = left_city_l[i], right_city_l[i]
         city_fuzzy[i] = fuzz.ratio(_safe(lc), _safe(rc)) / 100.0 if lc and rc else 0.0
 
+        # Char n-gram features
+        if USE_CHAR_NGRAM_FEATURES:
+            name_3gram[i] = _ngram_cosine_sim(a, b, 3)
+            name_4gram[i] = _ngram_cosine_sim(a, b, 4)
+            addr_3gram[i] = _ngram_cosine_sim(aa, ab, 3)
+
     out = pd.DataFrame({
         "source1_entity_id": pairs["source1_entity_id"].values,
         "other_entity_id": pairs["other_entity_id"].values,
@@ -109,10 +173,18 @@ def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.D
         "house_no_exact_match": ((left_house.notna()) & (right_house.notna())
                                   & (left_house == right_house)).astype(int).values,
         "country_match": (left_country.values == right_country.values).astype(int),
+        "name_char_3gram_cosine": name_3gram,
+        "name_char_4gram_cosine": name_4gram,
+        "addr_char_3gram_cosine": addr_3gram,
     })
 
     if "ann_score" in pairs.columns:
         out["ann_score"] = pairs["ann_score"].values
+
+    # Carry over provenance columns if present
+    for col in ["from_token_block", "from_ann"]:
+        if col in pairs.columns:
+            out[col] = pairs[col].values
 
     return out
 
