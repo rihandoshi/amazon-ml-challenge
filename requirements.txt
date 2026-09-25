@@ -1,0 +1,15 @@
+# Core pipeline (normalize -> block -> features -> train -> infer)
+pandas>=2.1
+numpy>=1.26
+rapidfuzz>=3.6
+lightgbm>=4.3
+scikit-learn>=1.4
+pyarrow>=15.0
+
+# Optional: only needed if you run with --use-embeddings (recommended for the
+# real submission — this is what recovers the Devanagari-vs-Latin and
+# heavy-typo matches token blocking misses). Both are MIT/Apache-licensed,
+# open-weight, well under the 8B-parameter cap.
+sentence-transformers>=2.6
+faiss-cpu>=1.8   # swap for faiss-gpu on a SageMaker GPU instance
+torch>=2.2
