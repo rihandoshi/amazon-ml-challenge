@@ -135,32 +135,79 @@ def _pairs_from_city_firsttoken_join(s1: pd.DataFrame, other: pd.DataFrame) -> p
     return pairs
 
 
+def _process_country_blocking(args_tuple):
+    """Process blocking for a single country (used in parallel).
+
+    Accepts a tuple to be compatible with Pool.map().
+    """
+    s1_c, other_c, country = args_tuple
+    if s1_c.empty or other_c.empty:
+        return pd.DataFrame(columns=["source1_entity_id", "other_entity_id"])
+
+    parts = []
+    s1_tok = _token_frame(s1_c)
+    other_tok = _token_frame(other_c)
+    parts.append(_pairs_from_token_join(s1_tok, other_tok))
+    parts.append(_pairs_from_zip_join(s1_c, other_c))
+    parts.append(_pairs_from_city_firsttoken_join(s1_c, other_c))
+    return pd.concat(parts, ignore_index=True).drop_duplicates()
+
+
 def generate_token_candidates(s1_df: pd.DataFrame, other_df: pd.DataFrame,
-                               per_country: bool = True) -> pd.DataFrame:
+                               per_country: bool = True,
+                               n_workers: int = None) -> pd.DataFrame:
     """Union of token / zip / city+first-token blocking, S1 vs one other source.
 
     Set per_country=True (default) to loop over countries and concat — keeps
     peak memory bounded, which matters once you scale to the real 2M x 5M+
     row files (do this on SageMaker with a large-memory instance, e.g.
     r6i.8xlarge, or push the loop body out to a Ray / multiprocessing pool).
+
+    Parallelized across countries using concurrent.futures for multi-core speedup.
     """
-    all_pairs = []
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    if n_workers is None:
+        from config import NUM_WORKERS
+        n_workers = NUM_WORKERS
+
     countries = sorted(set(s1_df["country"].unique()) | set(other_df["country"].unique())) \
         if per_country else [None]
 
+    # Build argument tuples for each country
+    country_args = []
     for c in countries:
         s1_c = s1_df[s1_df["country"] == c] if c is not None else s1_df
         other_c = other_df[other_df["country"] == c] if c is not None else other_df
         if s1_c.empty or other_c.empty:
             continue
-
         print(f"  Country={c}: S1={len(s1_c):,} Other={len(other_c):,}")
+        country_args.append((s1_c, other_c, c))
 
-        s1_tok = _token_frame(s1_c)
-        other_tok = _token_frame(other_c)
-        all_pairs.append(_pairs_from_token_join(s1_tok, other_tok))
-        all_pairs.append(_pairs_from_zip_join(s1_c, other_c))
-        all_pairs.append(_pairs_from_city_firsttoken_join(s1_c, other_c))
+    if not country_args:
+        return pd.DataFrame(columns=["source1_entity_id", "other_entity_id"])
+
+    # Parallel processing across countries
+    if len(country_args) > 1 and n_workers > 1:
+        all_pairs = []
+        with ProcessPoolExecutor(max_workers=min(n_workers, len(country_args))) as executor:
+            futures = {executor.submit(_process_country_blocking, args): args[2]
+                       for args in country_args}
+            for future in as_completed(futures):
+                country = futures[future]
+                try:
+                    result = future.result()
+                    if not result.empty:
+                        all_pairs.append(result)
+                except Exception as e:
+                    print(f"  WARNING: Blocking failed for country={country}: {e}")
+                    # Fallback: process sequentially
+                    for args in country_args:
+                        if args[2] == country:
+                            all_pairs.append(_process_country_blocking(args))
+    else:
+        # Single-country or single-worker: sequential
+        all_pairs = [_process_country_blocking(args) for args in country_args]
 
     if not all_pairs:
         return pd.DataFrame(columns=["source1_entity_id", "other_entity_id"])

@@ -5,9 +5,15 @@ no network calls, no geocoding APIs. Safe under the challenge's fair-play rules.
 """
 import re
 import unicodedata
+import numpy as np
 import pandas as pd
+from functools import partial
+from multiprocessing import Pool
 
-from config import NAME_TOKEN_MAP, ADDRESS_TOKEN_MAP, US_STATES, US_STATE_ABBRS, INDIAN_STATES
+from config import (
+    NAME_TOKEN_MAP, ADDRESS_TOKEN_MAP, US_STATES, US_STATE_ABBRS,
+    INDIAN_STATES, NUM_WORKERS,
+)
 
 _DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9\s]")
@@ -20,6 +26,13 @@ _GENERIC_POSTAL_RE = re.compile(r"\b(\d{5})\b")
 
 # Pattern for house/building numbers at the start of an address
 _HOUSE_NO_RE = re.compile(r"^\s*(\d+[a-z]?(?:[\s/-]\d+)?)\b", re.IGNORECASE)
+
+# Regex to detect ANY non-Latin/non-ASCII alphabetic characters
+# (used to decide if we need transliteration beyond Devanagari)
+# Note: Python's re doesn't support \p{P}, so we list common punct explicitly
+_NON_LATIN_ALPHA_RE = re.compile(
+    r"[^\u0000-\u024F\u0900-\u097F0-9\s!\"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~]",
+)
 
 # Minimal Devanagari -> Latin phonetic transliteration table.
 # This is a *rule-based character map*, not a lookup service — same category as
@@ -53,15 +66,55 @@ def transliterate_devanagari(text: str) -> str:
     return "".join(out)
 
 
+def transliterate_generic(text: str) -> str:
+    """Generic fallback transliteration for ANY non-Latin script.
+
+    Uses Unicode NFKD decomposition to strip diacritics + accents, then
+    drops remaining non-ASCII characters.  This handles:
+      - Accented Latin (French, German, Spanish, Portuguese)
+      - Cyrillic (partial — 'и' → dropped, but combined with embedding it helps)
+      - Arabic, Thai, CJK (characters dropped, but embedding model handles them)
+
+    The goal is NOT perfect transliteration — it's to give the fuzzy string
+    features *something* to compare rather than empty strings.  The multilingual
+    embedding model handles the heavy lifting for non-Latin scripts.
+    """
+    if not text:
+        return text
+    # First apply Devanagari-specific transliteration (better quality than generic)
+    text = transliterate_devanagari(text)
+    # NFKD decomposition separates base characters from combining marks
+    nfkd = unicodedata.normalize("NFKD", text)
+    # Keep only ASCII characters (base letters after decomposition)
+    ascii_text = nfkd.encode("ascii", errors="ignore").decode("ascii")
+    return ascii_text
+
+
 def has_devanagari(text: str) -> bool:
     return bool(text) and bool(_DEVANAGARI_RE.search(text))
+
+
+def has_non_latin(text: str) -> bool:
+    """Check if text contains characters outside Latin/Devanagari scripts."""
+    if not text:
+        return False
+    for ch in text:
+        cp = ord(ch)
+        # Skip ASCII, Extended Latin, Devanagari, whitespace, digits, punctuation
+        if cp <= 0x024F or (0x0900 <= cp <= 0x097F) or ch.isspace() or ch.isdigit():
+            continue
+        if unicodedata.category(ch).startswith("P"):
+            continue
+        return True
+    return False
 
 
 def _clean_basic(text: str) -> str:
     if not isinstance(text, str) or not text:
         return ""
     text = unicodedata.normalize("NFKC", text)
-    text = transliterate_devanagari(text)
+    # Apply transliteration: Devanagari first (high quality), then generic fallback
+    text = transliterate_generic(text)
     text = text.lower()
     text = _NON_ALNUM_RE.sub(" ", text)
     text = _MULTISPACE_RE.sub(" ", text).strip()
@@ -268,24 +321,55 @@ def normalize_address(raw_addr: str, country: str) -> dict:
     return {"norm_addr": norm_addr, "zip": zip_code, "state": state, "city": city, "house_no": house_no}
 
 
-def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_chunk(df_chunk: pd.DataFrame) -> pd.DataFrame:
+    """Normalize a single chunk of the dataframe (used for parallel processing)."""
+    df_chunk = df_chunk.copy()
+    df_chunk["business_name"] = df_chunk["business_name"].fillna("")
+    df_chunk["business_address"] = df_chunk["business_address"].fillna("")
+    df_chunk["country"] = df_chunk["country"].fillna("UNK")
+
+    name_info = df_chunk["business_name"].apply(normalize_name)
+    df_chunk["norm_name"] = name_info.apply(lambda d: d["norm_name"])
+    df_chunk["name_tokens"] = name_info.apply(lambda d: d["tokens"])
+
+    addr_info = df_chunk.apply(
+        lambda r: normalize_address(r["business_address"], r["country"]), axis=1
+    )
+    df_chunk["norm_addr"] = addr_info.apply(lambda d: d["norm_addr"])
+    df_chunk["zip"] = addr_info.apply(lambda d: d["zip"])
+    df_chunk["state"] = addr_info.apply(lambda d: d["state"])
+    df_chunk["city"] = addr_info.apply(lambda d: d["city"])
+    df_chunk["house_no"] = addr_info.apply(lambda d: d["house_no"])
+    df_chunk["has_devanagari"] = df_chunk["business_name"].apply(has_devanagari)
+    return df_chunk
+
+
+def normalize_dataframe(df: pd.DataFrame, n_workers: int = None) -> pd.DataFrame:
     """Apply normalization to a raw source dataframe with
     entity_id, business_name, business_address, country columns.
+
+    Uses multiprocessing to parallelize across CPU cores for large datasets.
+    Falls back to single-process for small dataframes (<1000 rows) or if
+    multiprocessing fails (e.g. Windows without __main__ guard).
     """
-    df = df.copy()
-    df["business_name"] = df["business_name"].fillna("")
-    df["business_address"] = df["business_address"].fillna("")
-    df["country"] = df["country"].fillna("UNK")
+    if n_workers is None:
+        n_workers = NUM_WORKERS
 
-    name_info = df["business_name"].apply(normalize_name)
-    df["norm_name"] = name_info.apply(lambda d: d["norm_name"])
-    df["name_tokens"] = name_info.apply(lambda d: d["tokens"])
+    # For small datasets, single-process is faster (avoids serialization overhead)
+    if len(df) < 1000 or n_workers <= 1:
+        return _normalize_chunk(df)
 
-    addr_info = df.apply(lambda r: normalize_address(r["business_address"], r["country"]), axis=1)
-    df["norm_addr"] = addr_info.apply(lambda d: d["norm_addr"])
-    df["zip"] = addr_info.apply(lambda d: d["zip"])
-    df["state"] = addr_info.apply(lambda d: d["state"])
-    df["city"] = addr_info.apply(lambda d: d["city"])
-    df["house_no"] = addr_info.apply(lambda d: d["house_no"])
-    df["has_devanagari"] = df["business_name"].apply(has_devanagari)
-    return df
+    # Split into chunks and process in parallel
+    chunks = np.array_split(df, n_workers)
+    # Filter out empty chunks
+    chunks = [c for c in chunks if len(c) > 0]
+
+    print(f"    Normalizing {len(df):,} rows across {len(chunks)} workers...")
+    try:
+        with Pool(processes=len(chunks)) as pool:
+            results = pool.map(_normalize_chunk, chunks)
+        return pd.concat(results, ignore_index=True)
+    except (RuntimeError, OSError) as e:
+        # Fallback: single-process (happens on Windows without __main__ guard)
+        print(f"    Multiprocessing failed ({e.__class__.__name__}), falling back to single-process")
+        return _normalize_chunk(df)

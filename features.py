@@ -4,12 +4,16 @@ Takes a `candidate_pairs` frame (source1_entity_id, other_entity_id) plus the
 normalized S1 / other-source dataframes, and returns one feature row per pair.
 Vectorized with rapidfuzz.process / cdist where possible; falls back to
 row-wise apply only where necessary (address component comparisons).
+
+Parallelized: feature computation is split across CPU cores via joblib for
+large pair sets (>10k pairs).
 """
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz, distance
+from joblib import Parallel, delayed
 
-from config import USE_CHAR_NGRAM_FEATURES
+from config import USE_CHAR_NGRAM_FEATURES, NUM_WORKERS
 
 
 FEATURE_COLUMNS = [
@@ -78,20 +82,86 @@ def _ngram_cosine_sim(text_a: str, text_b: str, n: int) -> float:
     return dot / (norm_a * norm_b)
 
 
-def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.DataFrame) -> pd.DataFrame:
+def _compute_features_chunk(
+    left_chunk, right_chunk, left_addr_chunk, right_addr_chunk,
+    left_tokens_chunk, right_tokens_chunk,
+    left_city_chunk, right_city_chunk,
+    use_ngram_features,
+):
+    """Compute features for a chunk of pairs (called in parallel)."""
+    n = len(left_chunk)
+    jaro = np.empty(n); lev = np.empty(n); tsort = np.empty(n)
+    tset = np.empty(n); partial = np.empty(n); addr_tsort = np.empty(n)
+    addr_partial = np.empty(n); common_frac = np.empty(n); first_tok = np.empty(n)
+    city_fuzzy = np.empty(n)
+
+    name_3gram = np.zeros(n)
+    name_4gram = np.zeros(n)
+    addr_3gram = np.zeros(n)
+
+    for i in range(n):
+        a, b = _safe(left_chunk[i]), _safe(right_chunk[i])
+        jaro[i] = distance.JaroWinkler.similarity(a, b) if a and b else 0.0
+        lev[i] = fuzz.ratio(a, b) / 100.0
+        tsort[i] = fuzz.token_sort_ratio(a, b) / 100.0
+        tset[i] = fuzz.token_set_ratio(a, b) / 100.0
+        partial[i] = fuzz.partial_ratio(a, b) / 100.0
+
+        aa, ab = _safe(left_addr_chunk[i]), _safe(right_addr_chunk[i])
+        addr_tsort[i] = fuzz.token_sort_ratio(aa, ab) / 100.0 if aa and ab else 0.0
+        addr_partial[i] = fuzz.partial_ratio(aa, ab) / 100.0 if aa and ab else 0.0
+
+        lt = left_tokens_chunk[i] if isinstance(left_tokens_chunk[i], list) else []
+        rt = right_tokens_chunk[i] if isinstance(right_tokens_chunk[i], list) else []
+        if lt and rt:
+            common = len(set(lt) & set(rt))
+            common_frac[i] = common / max(len(set(lt) | set(rt)), 1)
+            first_tok[i] = 1.0 if lt[0] == rt[0] else 0.0
+        else:
+            common_frac[i] = 0.0
+            first_tok[i] = 0.0
+
+        lc, rc = left_city_chunk[i], right_city_chunk[i]
+        city_fuzzy[i] = fuzz.ratio(_safe(lc), _safe(rc)) / 100.0 if lc and rc else 0.0
+
+        if use_ngram_features:
+            name_3gram[i] = _ngram_cosine_sim(a, b, 3)
+            name_4gram[i] = _ngram_cosine_sim(a, b, 4)
+            addr_3gram[i] = _ngram_cosine_sim(aa, ab, 3)
+
+    return {
+        "jaro": jaro, "lev": lev, "tsort": tsort, "tset": tset, "partial": partial,
+        "addr_tsort": addr_tsort, "addr_partial": addr_partial,
+        "common_frac": common_frac, "first_tok": first_tok, "city_fuzzy": city_fuzzy,
+        "name_3gram": name_3gram, "name_4gram": name_4gram, "addr_3gram": addr_3gram,
+    }
+
+
+def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.DataFrame,
+                         n_workers: int = None) -> pd.DataFrame:
     """`pairs` needs columns source1_entity_id, other_entity_id.
     `s1_df` / `other_df` need the columns produced by normalize.normalize_dataframe.
+
+    Parallelized across CPU cores for large pair sets.
+    Robust to unseen entity IDs (fills NaN with safe defaults).
     """
+    if n_workers is None:
+        n_workers = NUM_WORKERS
+
     s1_idx = s1_df.set_index("entity_id")
     other_idx = other_df.set_index("entity_id")
 
-    left = pairs["source1_entity_id"].map(s1_idx["norm_name"])
-    right = pairs["other_entity_id"].map(other_idx["norm_name"])
-    left_addr = pairs["source1_entity_id"].map(s1_idx["norm_addr"])
-    right_addr = pairs["other_entity_id"].map(other_idx["norm_addr"])
+    # Safe .map() with .fillna() to handle unseen entity IDs gracefully
+    left = pairs["source1_entity_id"].map(s1_idx["norm_name"]).fillna("")
+    right = pairs["other_entity_id"].map(other_idx["norm_name"]).fillna("")
+    left_addr = pairs["source1_entity_id"].map(s1_idx["norm_addr"]).fillna("")
+    right_addr = pairs["other_entity_id"].map(other_idx["norm_addr"]).fillna("")
 
     left_tokens = pairs["source1_entity_id"].map(s1_idx["name_tokens"])
     right_tokens = pairs["other_entity_id"].map(other_idx["name_tokens"])
+    # Replace NaN tokens with empty lists
+    left_tokens = left_tokens.apply(lambda x: x if isinstance(x, list) else [])
+    right_tokens = right_tokens.apply(lambda x: x if isinstance(x, list) else [])
 
     left_city = pairs["source1_entity_id"].map(s1_idx["city"])
     right_city = pairs["other_entity_id"].map(other_idx["city"])
@@ -101,55 +171,63 @@ def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.D
     right_zip = pairs["other_entity_id"].map(other_idx["zip"])
     left_house = pairs["source1_entity_id"].map(s1_idx["house_no"])
     right_house = pairs["other_entity_id"].map(other_idx["house_no"])
-    left_country = pairs["source1_entity_id"].map(s1_idx["country"])
-    right_country = pairs["other_entity_id"].map(other_idx["country"])
+    left_country = pairs["source1_entity_id"].map(s1_idx["country"]).fillna("UNK")
+    right_country = pairs["other_entity_id"].map(other_idx["country"]).fillna("UNK")
 
     n = len(pairs)
-    jaro = np.empty(n); lev = np.empty(n); tsort = np.empty(n)
-    tset = np.empty(n); partial = np.empty(n); addr_tsort = np.empty(n)
-    addr_partial = np.empty(n); common_frac = np.empty(n); first_tok = np.empty(n)
-    city_fuzzy = np.empty(n)
 
-    # Char n-gram arrays (always allocated; filled with 0 if disabled)
-    name_3gram = np.zeros(n)
-    name_4gram = np.zeros(n)
-    addr_3gram = np.zeros(n)
-
-    left = left.tolist(); right = right.tolist()
-    left_addr = left_addr.tolist(); right_addr = right_addr.tolist()
-    left_tokens = left_tokens.tolist(); right_tokens = right_tokens.tolist()
+    # Convert to lists for chunking
+    left_l = left.tolist(); right_l = right.tolist()
+    left_addr_l = left_addr.tolist(); right_addr_l = right_addr.tolist()
+    left_tokens_l = left_tokens.tolist(); right_tokens_l = right_tokens.tolist()
     left_city_l = left_city.tolist(); right_city_l = right_city.tolist()
 
-    for i in range(n):
-        a, b = _safe(left[i]), _safe(right[i])
-        jaro[i] = distance.JaroWinkler.similarity(a, b) if a and b else 0.0
-        lev[i] = fuzz.ratio(a, b) / 100.0
-        tsort[i] = fuzz.token_sort_ratio(a, b) / 100.0
-        tset[i] = fuzz.token_set_ratio(a, b) / 100.0
-        partial[i] = fuzz.partial_ratio(a, b) / 100.0
-
-        aa, ab = _safe(left_addr[i]), _safe(right_addr[i])
-        addr_tsort[i] = fuzz.token_sort_ratio(aa, ab) / 100.0 if aa and ab else 0.0
-        addr_partial[i] = fuzz.partial_ratio(aa, ab) / 100.0 if aa and ab else 0.0
-
-        lt = left_tokens[i] if isinstance(left_tokens[i], list) else []
-        rt = right_tokens[i] if isinstance(right_tokens[i], list) else []
-        if lt and rt:
-            common = len(set(lt) & set(rt))
-            common_frac[i] = common / max(len(set(lt) | set(rt)), 1)
-            first_tok[i] = 1.0 if lt[0] == rt[0] else 0.0
-        else:
-            common_frac[i] = 0.0
-            first_tok[i] = 0.0
-
-        lc, rc = left_city_l[i], right_city_l[i]
-        city_fuzzy[i] = fuzz.ratio(_safe(lc), _safe(rc)) / 100.0 if lc and rc else 0.0
-
-        # Char n-gram features
-        if USE_CHAR_NGRAM_FEATURES:
-            name_3gram[i] = _ngram_cosine_sim(a, b, 3)
-            name_4gram[i] = _ngram_cosine_sim(a, b, 4)
-            addr_3gram[i] = _ngram_cosine_sim(aa, ab, 3)
+    # ---- Parallel feature computation ----
+    if n > 10_000 and n_workers > 1:
+        chunk_size = (n + n_workers - 1) // n_workers
+        results = Parallel(n_jobs=n_workers, backend="loky")(
+            delayed(_compute_features_chunk)(
+                left_l[start:start + chunk_size],
+                right_l[start:start + chunk_size],
+                left_addr_l[start:start + chunk_size],
+                right_addr_l[start:start + chunk_size],
+                left_tokens_l[start:start + chunk_size],
+                right_tokens_l[start:start + chunk_size],
+                left_city_l[start:start + chunk_size],
+                right_city_l[start:start + chunk_size],
+                USE_CHAR_NGRAM_FEATURES,
+            )
+            for start in range(0, n, chunk_size)
+        )
+        # Concatenate chunk results
+        jaro = np.concatenate([r["jaro"] for r in results])
+        lev = np.concatenate([r["lev"] for r in results])
+        tsort = np.concatenate([r["tsort"] for r in results])
+        tset = np.concatenate([r["tset"] for r in results])
+        partial = np.concatenate([r["partial"] for r in results])
+        addr_tsort = np.concatenate([r["addr_tsort"] for r in results])
+        addr_partial = np.concatenate([r["addr_partial"] for r in results])
+        common_frac = np.concatenate([r["common_frac"] for r in results])
+        first_tok = np.concatenate([r["first_tok"] for r in results])
+        city_fuzzy = np.concatenate([r["city_fuzzy"] for r in results])
+        name_3gram = np.concatenate([r["name_3gram"] for r in results])
+        name_4gram = np.concatenate([r["name_4gram"] for r in results])
+        addr_3gram = np.concatenate([r["addr_3gram"] for r in results])
+    else:
+        # Single-process fallback for small datasets
+        result = _compute_features_chunk(
+            left_l, right_l, left_addr_l, right_addr_l,
+            left_tokens_l, right_tokens_l,
+            left_city_l, right_city_l,
+            USE_CHAR_NGRAM_FEATURES,
+        )
+        jaro = result["jaro"]; lev = result["lev"]; tsort = result["tsort"]
+        tset = result["tset"]; partial = result["partial"]
+        addr_tsort = result["addr_tsort"]; addr_partial = result["addr_partial"]
+        common_frac = result["common_frac"]; first_tok = result["first_tok"]
+        city_fuzzy = result["city_fuzzy"]
+        name_3gram = result["name_3gram"]; name_4gram = result["name_4gram"]
+        addr_3gram = result["addr_3gram"]
 
     out = pd.DataFrame({
         "source1_entity_id": pairs["source1_entity_id"].values,
@@ -159,8 +237,8 @@ def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.D
         "name_token_sort_ratio": tsort,
         "name_token_set_ratio": tset,
         "name_partial_ratio": partial,
-        "name_len_diff": np.abs(pd.Series(left).str.len().fillna(0).values
-                                 - pd.Series(right).str.len().fillna(0).values),
+        "name_len_diff": np.abs(pd.Series(left_l).str.len().fillna(0).values
+                                 - pd.Series(right_l).str.len().fillna(0).values),
         "name_common_token_frac": common_frac,
         "name_first_token_match": first_tok,
         "addr_token_sort_ratio": addr_tsort,
@@ -189,16 +267,42 @@ def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.D
     return out
 
 
-def quick_score(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.DataFrame) -> pd.Series:
+def _quick_score_chunk(left_chunk, right_chunk):
+    """Score a chunk of pairs (used in parallel quick_score)."""
+    return [fuzz.token_set_ratio(a, b) for a, b in zip(left_chunk, right_chunk)]
+
+
+def quick_score(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.DataFrame,
+                n_workers: int = None) -> pd.Series:
     """Cheap single-number similarity used only to rank/cap candidates before
     full feature engineering (see blocking.cap_candidates_per_entity) —
     NOT the final model score.
+
+    Parallelized for large pair sets (>10k).
+    Robust to unseen entity IDs (fills NaN with empty string).
     """
+    if n_workers is None:
+        n_workers = NUM_WORKERS
+
     s1_idx = s1_df.set_index("entity_id")["norm_name"]
     other_idx = other_df.set_index("entity_id")["norm_name"]
-    left = pairs["source1_entity_id"].map(s1_idx).fillna("")
-    right = pairs["other_entity_id"].map(other_idx).fillna("")
-    return pd.Series(
-        [fuzz.token_set_ratio(a, b) for a, b in zip(left, right)],
-        index=pairs.index,
-    )
+    left = pairs["source1_entity_id"].map(s1_idx).fillna("").tolist()
+    right = pairs["other_entity_id"].map(other_idx).fillna("").tolist()
+
+    n = len(left)
+    if n > 10_000 and n_workers > 1:
+        chunk_size = (n + n_workers - 1) // n_workers
+        results = Parallel(n_jobs=n_workers, backend="loky")(
+            delayed(_quick_score_chunk)(
+                left[start:start + chunk_size],
+                right[start:start + chunk_size],
+            )
+            for start in range(0, n, chunk_size)
+        )
+        scores = []
+        for r in results:
+            scores.extend(r)
+    else:
+        scores = [fuzz.token_set_ratio(a, b) for a, b in zip(left, right)]
+
+    return pd.Series(scores, index=pairs.index)
