@@ -61,7 +61,7 @@ def get_sparse_top_k(A, B, top_k=20, batch_size=500, min_score=0.1):
 # instead of once per (S1, S2) and once per (S1, S3) call.
 # ---------------------------------------------------------------------------
 
-def fit_vectorizer(text_series_list, ngram_range=(3, 4), min_df=2, max_df=0.5):
+def fit_vectorizer(text_series_list, ngram_range=(3, 4), min_df=5, max_df=0.05):
     """Fit one char n-gram TF-IDF vectorizer across several text columns
     (typically [s1[text_col], s2[text_col], s3[text_col]]).
     """
