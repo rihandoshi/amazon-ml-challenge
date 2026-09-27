@@ -2,9 +2,9 @@
 import os
 
 # ---------------------------------------------------------------------------
-# Parallelism — auto-detect vCPUs, cap at 8 (ml.r5.2xlarge = 8 vCPUs)
+# Parallelism — auto-detect vCPUs, cap at 16 (ml.r5.4xlarge = 16 vCPUs)
 # ---------------------------------------------------------------------------
-NUM_WORKERS = min(os.cpu_count() or 4, 8)
+NUM_WORKERS = min(os.cpu_count() or 4, 16)
 
 # ---------------------------------------------------------------------------
 # Checkpointing — enable stage-level resume on crash

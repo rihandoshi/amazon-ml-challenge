@@ -14,7 +14,15 @@ Two complementary strategies, unioned together:
    estimated pair count (s1_count × other_count) exceeds MAX_TOKEN_BLOCK_PAIRS,
    preventing the catastrophic 146 GiB memory explosion.
 
-2. Embedding ANN (ANN = approximate nearest neighbour via FAISS), catching
+2. Phonetic blocking (Soundex): group names by Soundex code to catch
+   phonetic variants — McDonald/MacDonald, Caloce/Calosa, Singh/Sing, etc.
+   Cheap and fast: Soundex is O(name_length) and the merge is small.
+
+3. Character trigram blocking: extract all 3-char substrings from the
+   normalized name, then join on shared trigrams. Catches heavy-typo cases
+   where token blocking fails because every token is misspelled.
+
+4. Embedding ANN (ANN = approximate nearest neighbour via FAISS), catching
    cases with *no* shared token at all: typos that change every token,
    transliteration (Devanagari S2/S3 name vs Latin S1 name), heavy
    abbreviation, or reordering beyond what token blocking's stopword
@@ -22,11 +30,12 @@ Two complementary strategies, unioned together:
    MIT/Apache-licensed and open weight (<=1B params), so it does not
    conflict with the "MIT/Apache, <=8B params" model constraint.
 
-Both stages emit (source1_entity_id, other_entity_id) pairs; the union,
+All stages emit (source1_entity_id, other_entity_id) pairs; the union,
 deduplicated, is your `candidate_pairs.tsv` (after the feature+model stage
 narrows candidates -> matches, per the problem statement: candidate_pairs.tsv
 must be the *last* candidate set actually scored).
 """
+import re
 import pandas as pd
 
 from config import (
@@ -135,10 +144,177 @@ def _pairs_from_city_firsttoken_join(s1: pd.DataFrame, other: pd.DataFrame) -> p
     return pairs
 
 
+# Soundex digit map: each lowercase letter -> digit (0=ignored, 1-6=groups)
+_SOUNDEX_MAP = {
+    'a': '0', 'e': '0', 'i': '0', 'o': '0', 'u': '0',
+    'y': '0', 'h': '0', 'w': '0',
+    'b': '1', 'f': '1', 'p': '1', 'v': '1',
+    'c': '2', 'g': '2', 'j': '2', 'k': '2',
+    'q': '2', 's': '2', 'x': '2', 'z': '2',
+    'd': '3', 't': '3',
+    'l': '4',
+    'm': '5', 'n': '5',
+    'r': '6',
+}
+
+
+def _soundex(name: str) -> str:
+    """Soundex encoding for a full normalized business name.
+
+    Uses the whole name (spaces removed) to produce a phonetic code
+    that captures the full name's sound rather than just the first word.
+    """
+    if not name:
+        return ""
+    joined = re.sub(r"\s+", "", name.lower())
+    if not joined:
+        return ""
+    first = joined[0].upper()
+    coded = []
+    prev = _SOUNDEX_MAP.get(joined[0], '0')
+    for ch in joined[1:]:
+        digit = _SOUNDEX_MAP.get(ch, '0')
+        if digit != '0' and digit != prev:
+            coded.append(digit)
+        prev = digit
+    return first + "".join(coded[:3]).ljust(3, "0")
+
+
+def _pairs_from_soundex_join(s1: pd.DataFrame, other: pd.DataFrame,
+                              max_block_pairs: int = MAX_TOKEN_BLOCK_PAIRS) -> pd.DataFrame:
+    """Phonetic blocking: join on (country, soundex_code) of norm_name.
+
+    Catches phonetic variants: McDonald/MacDonald, Caloce/Calosa,
+    Singh/Sing, Sharma/Sarma, etc. Fast — Soundex is O(name_len).
+    Uses same frequency-safety guard as token blocking.
+    """
+    a = s1[["entity_id", "country", "norm_name"]].copy()
+    b = other[["entity_id", "country", "norm_name"]].copy()
+
+    a["sdx"] = a["norm_name"].apply(_soundex)
+    b["sdx"] = b["norm_name"].apply(_soundex)
+
+    # Filter out empty/degenerate codes
+    a = a[(a["sdx"] != "") & (a["sdx"] != "0000")]
+    b = b[(b["sdx"] != "") & (b["sdx"] != "0000")]
+
+    if a.empty or b.empty:
+        return pd.DataFrame(columns=["source1_entity_id", "other_entity_id"])
+
+    # Frequency safety: skip Soundex codes that produce huge blocks
+    s1_freq = a.groupby(["country", "sdx"])["entity_id"].nunique().reset_index(name="s1_count")
+    ot_freq = b.groupby(["country", "sdx"])["entity_id"].nunique().reset_index(name="ot_count")
+    block_stats = s1_freq.merge(ot_freq, on=["country", "sdx"], how="inner")
+    block_stats["est_pairs"] = block_stats["s1_count"] * block_stats["ot_count"]
+    safe = block_stats[
+        (block_stats["est_pairs"] <= max_block_pairs) &
+        (block_stats["s1_count"] <= MAX_TOKEN_FREQ) &
+        (block_stats["ot_count"] <= MAX_TOKEN_FREQ)
+    ][["country", "sdx"]]
+
+    if safe.empty:
+        return pd.DataFrame(columns=["source1_entity_id", "other_entity_id"])
+
+    a_safe = a.merge(safe, on=["country", "sdx"], how="inner")
+    b_safe = b.merge(safe, on=["country", "sdx"], how="inner")
+    merged = a_safe.merge(b_safe, on=["country", "sdx"], suffixes=("_s1", "_other"))
+    pairs = merged[["entity_id_s1", "entity_id_other"]].drop_duplicates()
+    pairs.columns = ["source1_entity_id", "other_entity_id"]
+    return pairs
+
+
+def _char_trigrams(text: str) -> set:
+    """Return the set of character trigrams from a string."""
+    if not text or len(text) < 3:
+        return set(text) if text else set()
+    return {text[i:i+3] for i in range(len(text) - 2)}
+
+
+def _pairs_from_name_trigram_join(s1: pd.DataFrame, other: pd.DataFrame,
+                                   min_jaccard: float = 0.3,
+                                   max_block_pairs: int = MAX_TOKEN_BLOCK_PAIRS) -> pd.DataFrame:
+    """Character-trigram Jaccard blocking.
+
+    Extracts all 3-char substrings from norm_name, then joins on shared
+    trigrams (within same country). Filters to pairs whose trigram Jaccard
+    similarity >= min_jaccard. This catches heavy-typo names that share
+    no full token but still have significant character overlap.
+
+    min_jaccard=0.3 is a loose threshold — the LightGBM model will
+    re-rank these; we just want to maximise recall at this stage.
+    """
+    # Build (entity_id, country, trigram) exploded frames
+    def _explode_trigrams(df):
+        rows = []
+        for eid, country, name in zip(df["entity_id"], df["country"], df["norm_name"]):
+            tgs = _char_trigrams(str(name)) if name else set()
+            for tg in tgs:
+                rows.append((eid, country, tg))
+        return pd.DataFrame(rows, columns=["entity_id", "country", "trigram"])
+
+    if s1.empty or other.empty:
+        return pd.DataFrame(columns=["source1_entity_id", "other_entity_id"])
+
+    a_tg = _explode_trigrams(s1)
+    b_tg = _explode_trigrams(other)
+
+    if a_tg.empty or b_tg.empty:
+        return pd.DataFrame(columns=["source1_entity_id", "other_entity_id"])
+
+    # Frequency safety on trigram blocks
+    s1_freq = a_tg.groupby(["country", "trigram"])["entity_id"].nunique().reset_index(name="s1_count")
+    ot_freq = b_tg.groupby(["country", "trigram"])["entity_id"].nunique().reset_index(name="ot_count")
+    block_stats = s1_freq.merge(ot_freq, on=["country", "trigram"], how="inner")
+    block_stats["est_pairs"] = block_stats["s1_count"] * block_stats["ot_count"]
+    safe = block_stats[
+        (block_stats["est_pairs"] <= max_block_pairs) &
+        (block_stats["s1_count"] <= MAX_TOKEN_FREQ) &
+        (block_stats["ot_count"] <= MAX_TOKEN_FREQ)
+    ][["country", "trigram"]]
+
+    if safe.empty:
+        return pd.DataFrame(columns=["source1_entity_id", "other_entity_id"])
+
+    a_safe = a_tg.merge(safe, on=["country", "trigram"], how="inner")
+    b_safe = b_tg.merge(safe, on=["country", "trigram"], how="inner")
+
+    # Count shared trigrams per pair
+    merged = a_safe.merge(b_safe, on=["country", "trigram"], suffixes=("_s1", "_other"))
+    shared_counts = (
+        merged.groupby(["entity_id_s1", "entity_id_other"])["trigram"]
+        .count().reset_index(name="shared")
+    )
+
+    # Compute Jaccard: need total trigrams per entity
+    s1_sizes = a_tg.groupby("entity_id")["trigram"].nunique().reset_index(name="sz_s1")
+    ot_sizes = b_tg.groupby("entity_id")["trigram"].nunique().reset_index(name="sz_ot")
+    shared_counts = shared_counts.merge(
+        s1_sizes, left_on="entity_id_s1", right_on="entity_id", how="left"
+    ).drop(columns="entity_id")
+    shared_counts = shared_counts.merge(
+        ot_sizes, left_on="entity_id_other", right_on="entity_id", how="left"
+    ).drop(columns="entity_id")
+    shared_counts["union"] = (
+        shared_counts["sz_s1"].fillna(1) +
+        shared_counts["sz_ot"].fillna(1) -
+        shared_counts["shared"]
+    )
+    shared_counts["jaccard"] = shared_counts["shared"] / shared_counts["union"].clip(lower=1)
+
+    keep = shared_counts[shared_counts["jaccard"] >= min_jaccard]
+    if keep.empty:
+        return pd.DataFrame(columns=["source1_entity_id", "other_entity_id"])
+
+    pairs = keep[["entity_id_s1", "entity_id_other"]].drop_duplicates()
+    pairs.columns = ["source1_entity_id", "other_entity_id"]
+    return pairs
+
+
 def _process_country_blocking(args_tuple):
     """Process blocking for a single country (used in parallel).
 
     Accepts a tuple to be compatible with Pool.map().
+    Runs: token blocking + zip + city+first-token + phonetic (Soundex) + trigram.
     """
     s1_c, other_c, country = args_tuple
     if s1_c.empty or other_c.empty:
@@ -150,6 +326,10 @@ def _process_country_blocking(args_tuple):
     parts.append(_pairs_from_token_join(s1_tok, other_tok))
     parts.append(_pairs_from_zip_join(s1_c, other_c))
     parts.append(_pairs_from_city_firsttoken_join(s1_c, other_c))
+    # Phonetic blocking: catches McDonald/MacDonald, Singh/Sing, etc.
+    parts.append(_pairs_from_soundex_join(s1_c, other_c))
+    # Trigram blocking: catches heavy-typo names with no shared full token
+    parts.append(_pairs_from_name_trigram_join(s1_c, other_c))
     return pd.concat(parts, ignore_index=True).drop_duplicates()
 
 
@@ -190,21 +370,25 @@ def generate_token_candidates(s1_df: pd.DataFrame, other_df: pd.DataFrame,
     # Parallel processing across countries
     if len(country_args) > 1 and n_workers > 1:
         all_pairs = []
-        with ProcessPoolExecutor(max_workers=min(n_workers, len(country_args))) as executor:
-            futures = {executor.submit(_process_country_blocking, args): args[2]
-                       for args in country_args}
-            for future in as_completed(futures):
-                country = futures[future]
-                try:
-                    result = future.result()
-                    if not result.empty:
-                        all_pairs.append(result)
-                except Exception as e:
-                    print(f"  WARNING: Blocking failed for country={country}: {e}")
-                    # Fallback: process sequentially
-                    for args in country_args:
-                        if args[2] == country:
-                            all_pairs.append(_process_country_blocking(args))
+        try:
+            with ProcessPoolExecutor(max_workers=min(n_workers, len(country_args))) as executor:
+                futures = {executor.submit(_process_country_blocking, args): args[2]
+                           for args in country_args}
+                for future in as_completed(futures):
+                    country = futures[future]
+                    try:
+                        result = future.result()
+                        if not result.empty:
+                            all_pairs.append(result)
+                    except Exception as e:
+                        print(f"  WARNING: Blocking failed for country={country}: {e}")
+                        for args in country_args:
+                            if args[2] == country:
+                                all_pairs.append(_process_country_blocking(args))
+        except RuntimeError as e:
+            # Windows: multiprocessing requires __main__ guard. Fall back to sequential.
+            print(f"  [blocking] Multiprocessing unavailable ({e.__class__.__name__}), using sequential.")
+            all_pairs = [_process_country_blocking(args) for args in country_args]
     else:
         # Single-country or single-worker: sequential
         all_pairs = [_process_country_blocking(args) for args in country_args]

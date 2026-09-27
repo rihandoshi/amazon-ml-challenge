@@ -27,6 +27,8 @@ FEATURE_COLUMNS = [
     # Char n-gram cosine similarity features (added when USE_CHAR_NGRAM_FEATURES=True)
     "name_char_3gram_cosine", "name_char_4gram_cosine",
     "addr_char_3gram_cosine",
+    # Trigram Jaccard + phonetic features (always computed, cheap)
+    "name_trigram_jaccard", "name_soundex_match",
 ]
 
 
@@ -82,6 +84,54 @@ def _ngram_cosine_sim(text_a: str, text_b: str, n: int) -> float:
     return dot / (norm_a * norm_b)
 
 
+_SOUNDEX_MAP_F = {
+    'a': '0', 'e': '0', 'i': '0', 'o': '0', 'u': '0',
+    'y': '0', 'h': '0', 'w': '0',
+    'b': '1', 'f': '1', 'p': '1', 'v': '1',
+    'c': '2', 'g': '2', 'j': '2', 'k': '2',
+    'q': '2', 's': '2', 'x': '2', 'z': '2',
+    'd': '3', 't': '3',
+    'l': '4',
+    'm': '5', 'n': '5',
+    'r': '6',
+}
+
+
+def _soundex_code(name: str) -> str:
+    """Soundex code for feature engineering."""
+    import re as _re
+    if not name:
+        return ""
+    joined = _re.sub(r"\s+", "", name.lower())
+    if not joined:
+        return ""
+    first = joined[0].upper()
+    coded = []
+    prev = _SOUNDEX_MAP_F.get(joined[0], '0')
+    for ch in joined[1:]:
+        digit = _SOUNDEX_MAP_F.get(ch, '0')
+        if digit != '0' and digit != prev:
+            coded.append(digit)
+        prev = digit
+    return first + "".join(coded[:3]).ljust(3, "0")
+
+
+
+def _trigram_jaccard(a: str, b: str) -> float:
+    """Trigram Jaccard similarity between two strings."""
+    if not a or not b:
+        return 0.0
+    tg_a = {a[i:i+3] for i in range(len(a) - 2)} if len(a) >= 3 else set(a)
+    tg_b = {b[i:i+3] for i in range(len(b) - 2)} if len(b) >= 3 else set(b)
+    if not tg_a or not tg_b:
+        return 0.0
+    inter = len(tg_a & tg_b)
+    union = len(tg_a | tg_b)
+    return inter / union if union > 0 else 0.0
+
+
+
+
 def _compute_features_chunk(
     left_chunk, right_chunk, left_addr_chunk, right_addr_chunk,
     left_tokens_chunk, right_tokens_chunk,
@@ -98,6 +148,8 @@ def _compute_features_chunk(
     name_3gram = np.zeros(n)
     name_4gram = np.zeros(n)
     addr_3gram = np.zeros(n)
+    trig_jacc = np.zeros(n)
+    sdx_match = np.zeros(n)
 
     for i in range(n):
         a, b = _safe(left_chunk[i]), _safe(right_chunk[i])
@@ -129,11 +181,16 @@ def _compute_features_chunk(
             name_4gram[i] = _ngram_cosine_sim(a, b, 4)
             addr_3gram[i] = _ngram_cosine_sim(aa, ab, 3)
 
+        # Trigram Jaccard + Soundex match (always computed, cheap)
+        trig_jacc[i] = _trigram_jaccard(a, b)
+        sdx_match[i] = 1.0 if _soundex_code(a) == _soundex_code(b) and a and b else 0.0
+
     return {
         "jaro": jaro, "lev": lev, "tsort": tsort, "tset": tset, "partial": partial,
         "addr_tsort": addr_tsort, "addr_partial": addr_partial,
         "common_frac": common_frac, "first_tok": first_tok, "city_fuzzy": city_fuzzy,
         "name_3gram": name_3gram, "name_4gram": name_4gram, "addr_3gram": addr_3gram,
+        "trig_jacc": trig_jacc, "sdx_match": sdx_match,
     }
 
 
@@ -213,6 +270,8 @@ def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.D
         name_3gram = np.concatenate([r["name_3gram"] for r in results])
         name_4gram = np.concatenate([r["name_4gram"] for r in results])
         addr_3gram = np.concatenate([r["addr_3gram"] for r in results])
+        trig_jacc = np.concatenate([r["trig_jacc"] for r in results])
+        sdx_match = np.concatenate([r["sdx_match"] for r in results])
     else:
         # Single-process fallback for small datasets
         result = _compute_features_chunk(
@@ -228,6 +287,7 @@ def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.D
         city_fuzzy = result["city_fuzzy"]
         name_3gram = result["name_3gram"]; name_4gram = result["name_4gram"]
         addr_3gram = result["addr_3gram"]
+        trig_jacc = result["trig_jacc"]; sdx_match = result["sdx_match"]
 
     out = pd.DataFrame({
         "source1_entity_id": pairs["source1_entity_id"].values,
@@ -254,6 +314,8 @@ def build_pair_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.D
         "name_char_3gram_cosine": name_3gram,
         "name_char_4gram_cosine": name_4gram,
         "addr_char_3gram_cosine": addr_3gram,
+        "name_trigram_jaccard": trig_jacc,
+        "name_soundex_match": sdx_match,
     })
 
     if "ann_score" in pairs.columns:
