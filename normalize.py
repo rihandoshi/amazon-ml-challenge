@@ -360,7 +360,8 @@ def normalize_dataframe(df: pd.DataFrame, n_workers: int = None) -> pd.DataFrame
         return _normalize_chunk(df)
 
     # Split into chunks and process in parallel
-    chunks = np.array_split(df, n_workers)
+    chunk_size = (len(df) + n_workers - 1) // n_workers
+    chunks = [df.iloc[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
     # Filter out empty chunks
     chunks = [c for c in chunks if len(c) > 0]
 
